@@ -280,10 +280,39 @@ function blankPage() {
 }
 
 let saveTimer = null;
+let savePending = false;
+
+/* Writing to IndexedDB clones every point on the page, so never let
+   it land in the gap between two strokes. Wait for a real pause,
+   and defer to idle time when the browser offers it. */
 function save() {
+  savePending = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => dbPut(page()).catch(error => console.error("save failed", error)), 400);
+  saveTimer = setTimeout(flush, 1500);
 }
+
+function flush() {
+  if (!savePending) return;
+  if (currentStroke || touches.size > 0) {
+    saveTimer = setTimeout(flush, 800);
+    return;
+  }
+  savePending = false;
+  const record = page();
+  const write = () => dbPut(record).catch(error => console.error("save failed", error));
+  if (window.requestIdleCallback) requestIdleCallback(write, { timeout: 3000 });
+  else write();
+}
+
+function flushNow() {
+  clearTimeout(saveTimer);
+  if (!savePending) return;
+  savePending = false;
+  dbPut(page()).catch(error => console.error("save failed", error));
+}
+
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushNow(); });
+window.addEventListener("pagehide", flushNow);
 
 /* ============================================================
    Canvas
@@ -421,7 +450,7 @@ let multiTouchStart = 0;
 let multiTouchMoved = false;
 
 canvas.addEventListener("pointerdown", event => {
-  wake();
+  if (event.pointerType !== "pen") wake();
 
   if (event.pointerType !== "pen" && cornerPointer === null && inCorner(event.clientX, event.clientY)) {
     cornerPointer = event.pointerId;
@@ -522,7 +551,8 @@ function endPointer(event) {
     page().strokes.push(currentStroke);
     currentStroke = null;
     save();
-    refreshBar();
+    /* The bar only changes on the first stroke, when Settings hides. */
+    if (page().strokes.length === 1) refreshBar();
   }
 }
 
@@ -852,6 +882,7 @@ document.getElementById("tPen").addEventListener("click", () => setTool("pen"));
 document.getElementById("tEraser").addEventListener("click", () => setTool("eraser"));
 
 function goTo(target) {
+  flushNow();
   index = clamp(target, 0, pages.length - 1);
   camera.x = 0; camera.y = 0; camera.zoom = 1;
   redoStack = [];
