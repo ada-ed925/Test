@@ -190,6 +190,9 @@
     <label for="key">Anthropic API key</label>
     <input id="key" type="password" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
 
+    <label for="workspace">Workspace ID, only if your key is not scoped to one</label>
+    <input id="workspace" type="text" placeholder="wrkspc_..." autocomplete="off" spellcheck="false">
+
     <label for="model">Model</label>
     <select id="model">
       <option value="claude-opus-5">Opus 5, best at hard maths</option>
@@ -258,7 +261,9 @@ const settings = {
   get model()  { return localStorage.getItem("margin.model") || "claude-opus-5"; },
   set model(v) { localStorage.setItem("margin.model", v); },
   get ctx()    { return localStorage.getItem("margin.ctx") || ""; },
-  set ctx(v)   { localStorage.setItem("margin.ctx", v); }
+  set ctx(v)   { localStorage.setItem("margin.ctx", v); },
+  get workspace()  { return localStorage.getItem("margin.workspace") || ""; },
+  set workspace(v) { localStorage.setItem("margin.workspace", v); }
 };
 
 /* ============================================================
@@ -285,7 +290,7 @@ function save() {
    ============================================================ */
 
 const canvas = document.getElementById("c");
-const ctx = canvas.getContext("2d", { desynchronized: true });
+const ctx = canvas.getContext("2d", { desynchronized: true, alpha: false });
 
 const camera = { x: 0, y: 0, zoom: 1 };
 const BASE_WIDTH = 2.3;
@@ -294,26 +299,47 @@ let redoStack = [];
 let tool = "pen";
 let currentStroke = null;
 
+/* Measuring the canvas forces a layout, so cache it and refresh
+   only when the geometry actually changes. */
+let rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+let dprScale = 1;
+
+function measure() {
+  rect = canvas.getBoundingClientRect();
+}
+
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
-  const rect = canvas.getBoundingClientRect();
+  measure();
   if (rect.width === 0 || rect.height === 0) return;
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
+  dprScale = canvas.width / rect.width;
   render();
 }
 
 function applyTransform() {
-  const dpr = canvas.width / canvas.getBoundingClientRect().width;
-  ctx.setTransform(dpr * camera.zoom, 0, 0, dpr * camera.zoom, dpr * camera.x, dpr * camera.y);
+  ctx.setTransform(dprScale * camera.zoom, 0, 0, dprScale * camera.zoom, dprScale * camera.x, dprScale * camera.y);
 }
 
 function toWorld(clientX, clientY) {
-  const rect = canvas.getBoundingClientRect();
   return {
     x: (clientX - rect.left - camera.x) / camera.zoom,
     y: (clientY - rect.top - camera.y) / camera.zoom
   };
+}
+
+/* Pan and pinch fire far faster than the display refreshes, so
+   coalesce redraws onto animation frames. */
+let frameQueued = false;
+
+function requestRender() {
+  if (frameQueued) return;
+  frameQueued = true;
+  requestAnimationFrame(() => {
+    frameQueued = false;
+    render();
+  });
 }
 
 const strokeWidth = pressure => BASE_WIDTH * (0.45 + 1.05 * (pressure || 0.5));
@@ -362,7 +388,6 @@ let pressTimer = null;
 let pressConsumed = false;
 
 function inCorner(clientX, clientY) {
-  const rect = canvas.getBoundingClientRect();
   return rect.right - clientX < HOT && clientY - rect.top < HOT;
 }
 
@@ -438,7 +463,7 @@ canvas.addEventListener("pointermove", event => {
     if (touches.size === 1) {
       camera.x += event.clientX - previous.x;
       camera.y += event.clientY - previous.y;
-      render();
+      requestRender();
     } else if (touches.size === 2 && pinch) {
       updatePinch();
     }
@@ -454,18 +479,23 @@ canvas.addEventListener("pointermove", event => {
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
+  /* One path for the whole batch. Width is constant across a batch,
+     which is a few milliseconds of ink, so the taper still reads. */
+  let pressureSum = 0;
+  const start = currentStroke.points[currentStroke.points.length - 1];
+  ctx.beginPath();
+  ctx.moveTo(start.x, start.y);
+
   for (const sample of samples) {
     const world = toWorld(sample.clientX, sample.clientY);
-    const last = currentStroke.points[currentStroke.points.length - 1];
     const point = { x: world.x, y: world.y, p: sample.pressure || 0.5 };
     currentStroke.points.push(point);
-
-    ctx.beginPath();
-    ctx.lineWidth = strokeWidth((point.p + last.p) / 2);
-    ctx.moveTo(last.x, last.y);
+    pressureSum += point.p;
     ctx.lineTo(point.x, point.y);
-    ctx.stroke();
   }
+
+  ctx.lineWidth = strokeWidth((pressureSum / samples.length + start.p) / 2);
+  ctx.stroke();
 });
 
 function endPointer(event) {
@@ -513,7 +543,6 @@ function updatePinch() {
   const [a, b] = [...touches.values()];
   const distance = Math.hypot(a.x - b.x, a.y - b.y);
   const centre = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  const rect = canvas.getBoundingClientRect();
 
   const target = clamp(pinch.zoom * (distance / pinch.distance), 0.3, 6);
   const anchor = {
@@ -523,12 +552,11 @@ function updatePinch() {
   camera.zoom = target;
   camera.x = centre.x - rect.left - anchor.x * target;
   camera.y = centre.y - rect.top - anchor.y * target;
-  render();
+  requestRender();
 }
 
 canvas.addEventListener("wheel", event => {
   event.preventDefault();
-  const rect = canvas.getBoundingClientRect();
   if (event.ctrlKey) {
     const target = clamp(camera.zoom * Math.exp(-event.deltaY * 0.01), 0.3, 6);
     const anchor = {
@@ -542,7 +570,7 @@ canvas.addEventListener("wheel", event => {
     camera.x -= event.deltaX;
     camera.y -= event.deltaY;
   }
-  render();
+  requestRender();
 }, { passive: false });
 
 function eraseAt(world) {
@@ -612,7 +640,7 @@ function snapshot(strokes) {
   const pad = 30;
   const width = (bounds.maxX - bounds.minX) + pad * 2;
   const height = (bounds.maxY - bounds.minY) + pad * 2;
-  const scale = clamp(1568 / Math.max(width, height), 0.5, 3);
+  const scale = Math.min(1568 / Math.max(width, height), 3);
 
   const off = document.createElement("canvas");
   off.width = Math.max(1, Math.round(width * scale));
@@ -666,15 +694,19 @@ async function solve() {
   const context = settings.ctx.trim();
   const text = context ? `${PROMPT}\n\nContext: this is from a course on ${context}.` : PROMPT;
 
+  const headers = {
+    "content-type": "application/json",
+    "x-api-key": settings.key.trim(),
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true"
+  };
+  const workspace = settings.workspace.trim();
+  if (workspace) headers["anthropic-workspace-id"] = workspace;
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": settings.key.trim(),
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true"
-      },
+      headers,
       body: JSON.stringify({
         model: settings.model,
         max_tokens: 4000,
@@ -688,7 +720,13 @@ async function solve() {
       })
     });
 
-    if (!response.ok) throw new Error(`${response.status}: ${(await response.text()).slice(0, 300)}`);
+    if (!response.ok) {
+      const raw = await response.text();
+      console.error("API rejected the request", response.status, raw);
+      let detail = raw;
+      try { detail = JSON.parse(raw).error.message; } catch (_) { /* keep the raw body */ }
+      throw new Error(`${response.status}: ${detail}`);
+    }
 
     const data = await response.json();
     const body = data.content.filter(part => part.type === "text").map(part => part.text).join("\n");
@@ -706,6 +744,7 @@ async function solve() {
 
 function explain(error) {
   const message = String(error.message || error);
+  if (/workspace/i.test(message)) return "This key needs a workspace ID. Put your wrkspc_ ID in settings, or make a key scoped to one workspace.";
   if (message.startsWith("401")) return "The key was rejected. Open settings on a blank page and check it.";
   if (message.startsWith("429")) return "Rate limited. Wait a moment and hold the corner again.";
   if (/Failed to fetch|NetworkError/i.test(message)) return "Could not reach Anthropic. Check the connection and the key.";
@@ -836,6 +875,7 @@ const scrim = document.getElementById("scrim");
 
 function openSettings() {
   document.getElementById("key").value = settings.key;
+  document.getElementById("workspace").value = settings.workspace;
   document.getElementById("model").value = settings.model;
   document.getElementById("ctx").value = settings.ctx;
   scrim.classList.add("show");
@@ -846,6 +886,7 @@ scrim.addEventListener("click", event => { if (event.target === scrim) scrim.cla
 
 document.getElementById("saveSettings").addEventListener("click", () => {
   settings.key = document.getElementById("key").value.trim();
+  settings.workspace = document.getElementById("workspace").value.trim();
   settings.model = document.getElementById("model").value;
   settings.ctx = document.getElementById("ctx").value.trim();
   scrim.classList.remove("show");
