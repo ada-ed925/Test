@@ -124,7 +124,7 @@
   /* ---------- the dot: top right of the writing surface ---------- */
 
   #dot {
-    position: absolute; z-index: 25; pointer-events: none;
+    position: absolute; z-index: 35; pointer-events: none;
     right: calc(env(safe-area-inset-right) + 26px);
     top: calc(env(safe-area-inset-top) + 26px);
     width: 9px; height: 9px; border-radius: 50%;
@@ -140,15 +140,18 @@
   /* ---------- the quiet bar, along the bottom ---------- */
 
   #bar {
-    position: absolute; left: 0; right: 0; bottom: 0; z-index: 30;
+    position: absolute; left: 0; right: 0; top: 0; z-index: 30;
     display: flex; align-items: center; gap: 2px;
-    padding: 10px 14px calc(env(safe-area-inset-bottom) + 8px);
+    padding: calc(env(safe-area-inset-top) + 8px) 118px 12px 14px;
     font-size: 13px; color: var(--quiet);
-    background: linear-gradient(rgba(255,255,255,0), var(--paper) 34%);
+    background: linear-gradient(var(--paper) 66%, rgba(255,255,255,0));
     opacity: 1; transition: opacity .5s ease;
+    /* The corner gesture lives underneath, so only the buttons
+       themselves should catch input. */
+    pointer-events: none;
   }
   #bar.dim { opacity: .12; }
-  #bar:hover { opacity: 1; }
+  #bar button { pointer-events: auto; }
 
   #bar button {
     font: inherit; color: inherit; background: none; border: 0;
@@ -210,7 +213,7 @@
       <button id="fit">Fit</button>
       <button id="photo">Photo</button>
       <button id="questions">Questions</button>
-      <input id="camera" type="file" accept="image/*" hidden>
+      <input id="camera" type="file" accept="image/*" capture="environment" hidden>
       <span class="spring"></span>
       <button id="prev">&lsaquo;</button>
       <span id="pageLabel">1 / 1</span>
@@ -1178,6 +1181,7 @@ function wake() {
 }
 
 bar.addEventListener("pointerdown", wake);
+bar.addEventListener("pointerover", wake);
 
 function refreshBar() {
   document.getElementById("prev").disabled = index === 0;
