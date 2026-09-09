@@ -67,7 +67,20 @@
   #panelBody ol, #panelBody ul { margin: 0 0 13px; padding-left: 20px; }
   #panelBody li { margin-bottom: 5px; }
   #panelBody .katex-display { margin: 15px 0; overflow-x: auto; overflow-y: hidden; }
-  #panelBody code { font-size: .88em; background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+  #panelBody code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: .84em; background: #f4f4f4; padding: 1px 4px; border-radius: 3px;
+  }
+  #panelBody pre {
+    background: #fafafa; border: 1px solid var(--hair); border-radius: 8px;
+    padding: 14px 16px; margin: 0 0 16px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
+  }
+  #panelBody pre code {
+    background: none; padding: 0; font-size: 13.5px; line-height: 1.55;
+    white-space: pre; display: block;
+  }
   #panelBody hr { border: 0; border-top: 1px solid var(--hair); margin: 26px 0; }
 
   .empty, .fail {
@@ -177,6 +190,9 @@
     <div id="bar">
       <button id="tPen" class="on">Pen</button>
       <button id="tEraser">Eraser</button>
+      <button id="fit">Fit</button>
+      <button id="photo">Photo</button>
+      <input id="camera" type="file" accept="image/*" hidden>
       <span class="spring"></span>
       <button id="prev">&lsaquo;</button>
       <span id="pageLabel">1 / 1</span>
@@ -329,6 +345,8 @@ const ctx = canvas.getContext("2d", { desynchronized: true, alpha: false });
 
 const camera = { x: 0, y: 0, zoom: 1 };
 const BASE_WIDTH = 2.3;
+const MIN_ZOOM = 0.6;
+const MAX_ZOOM = 3;
 
 let redoStack = [];
 let tool = "pen";
@@ -451,9 +469,55 @@ const refreshDot = () => dot.classList.toggle("ready", Boolean(page().solution))
    ============================================================ */
 
 const touches = new Map();
+const touchOrder = [];
 let pinch = null;
 let multiTouchStart = 0;
 let multiTouchMoved = false;
+
+/* Ink bounds are needed on every pan to keep the page findable, so
+   cache them and recompute only when the strokes change. */
+let boundsCache = null;
+const invalidateBounds = () => { boundsCache = null; };
+
+function pageBounds() {
+  if (boundsCache === null) boundsCache = inkBounds(page().strokes) || false;
+  return boundsCache || null;
+}
+
+/* Never let the work leave the screen entirely. */
+function constrainCamera() {
+  const bounds = pageBounds();
+  if (!bounds || rect.width === 0) return;
+
+  const margin = 90;
+  const left = bounds.minX * camera.zoom + camera.x;
+  const right = bounds.maxX * camera.zoom + camera.x;
+  const top = bounds.minY * camera.zoom + camera.y;
+  const bottom = bounds.maxY * camera.zoom + camera.y;
+
+  if (right < margin) camera.x += margin - right;
+  else if (left > rect.width - margin) camera.x -= left - (rect.width - margin);
+
+  if (bottom < margin) camera.y += margin - bottom;
+  else if (top > rect.height - margin) camera.y -= top - (rect.height - margin);
+}
+
+function fitToInk() {
+  const bounds = pageBounds();
+  if (!bounds || rect.width === 0) {
+    camera.x = 0; camera.y = 0; camera.zoom = 1;
+    render();
+    return;
+  }
+  const pad = 60;
+  const width = (bounds.maxX - bounds.minX) + pad * 2;
+  const height = (bounds.maxY - bounds.minY) + pad * 2;
+
+  camera.zoom = clamp(Math.min(rect.width / width, rect.height / height), MIN_ZOOM, 1.5);
+  camera.x = rect.width / 2 - ((bounds.minX + bounds.maxX) / 2) * camera.zoom;
+  camera.y = rect.height / 2 - ((bounds.minY + bounds.maxY) / 2) * camera.zoom;
+  render();
+}
 
 canvas.addEventListener("pointerdown", event => {
   if (event.pointerType !== "pen") wake();
@@ -466,11 +530,12 @@ canvas.addEventListener("pointerdown", event => {
 
   if (event.pointerType === "touch") {
     touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    touchOrder.push(event.pointerId);
     if (touches.size === 2 || touches.size === 3) {
       multiTouchStart = Date.now();
       multiTouchMoved = false;
     }
-    if (touches.size === 2) startPinch();
+    if (touches.size >= 2) startPinch();
     return;
   }
 
@@ -506,8 +571,9 @@ canvas.addEventListener("pointermove", event => {
     if (touches.size === 1) {
       camera.x += event.clientX - previous.x;
       camera.y += event.clientY - previous.y;
+      constrainCamera();
       requestRender();
-    } else if (touches.size === 2 && pinch) {
+    } else if (touches.size >= 2 && pinch) {
       updatePinch();
     }
     return;
@@ -561,7 +627,11 @@ function endPointer(event) {
     const held = touches.size;
     const quick = Date.now() - multiTouchStart < 320;
     touches.delete(event.pointerId);
+    const slot = touchOrder.indexOf(event.pointerId);
+    if (slot !== -1) touchOrder.splice(slot, 1);
+
     if (touches.size < 2) pinch = null;
+    else startPinch();
 
     if (quick && !multiTouchMoved) {
       if (held === 2) { undo(); multiTouchStart = 0; }
@@ -573,6 +643,7 @@ function endPointer(event) {
   if (currentStroke) {
     page().strokes.push(currentStroke);
     currentStroke = null;
+    invalidateBounds();
     save();
     /* The bar only changes on the first stroke, when Settings hides. */
     if (page().strokes.length === 1) refreshBar();
@@ -591,21 +662,34 @@ canvas.addEventListener("touchstart", swallow, { passive: false });
 canvas.addEventListener("touchmove", swallow, { passive: false });
 canvas.addEventListener("touchend", swallow, { passive: false });
 
+function pinchPair() {
+  const a = touches.get(touchOrder[0]);
+  const b = touches.get(touchOrder[1]);
+  return a && b ? [a, b] : null;
+}
+
 function startPinch() {
-  const [a, b] = [...touches.values()];
+  const pair = pinchPair();
+  if (!pair) { pinch = null; return; }
+  const [a, b] = pair;
+  const distance = Math.hypot(a.x - b.x, a.y - b.y);
+  if (distance < 20) { pinch = null; return; }
+
   pinch = {
-    distance: Math.hypot(a.x - b.x, a.y - b.y),
+    distance,
     centre: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
     zoom: camera.zoom
   };
 }
 
 function updatePinch() {
-  const [a, b] = [...touches.values()];
+  const pair = pinchPair();
+  if (!pair) return;
+  const [a, b] = pair;
   const distance = Math.hypot(a.x - b.x, a.y - b.y);
   const centre = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 
-  const target = clamp(pinch.zoom * (distance / pinch.distance), 0.3, 6);
+  const target = clamp(pinch.zoom * (distance / pinch.distance), MIN_ZOOM, MAX_ZOOM);
   const anchor = {
     x: (pinch.centre.x - rect.left - camera.x) / camera.zoom,
     y: (pinch.centre.y - rect.top - camera.y) / camera.zoom
@@ -613,13 +697,14 @@ function updatePinch() {
   camera.zoom = target;
   camera.x = centre.x - rect.left - anchor.x * target;
   camera.y = centre.y - rect.top - anchor.y * target;
+  constrainCamera();
   requestRender();
 }
 
 canvas.addEventListener("wheel", event => {
   event.preventDefault();
   if (event.ctrlKey) {
-    const target = clamp(camera.zoom * Math.exp(-event.deltaY * 0.01), 0.3, 6);
+    const target = clamp(camera.zoom * Math.exp(-event.deltaY * 0.01), MIN_ZOOM, MAX_ZOOM);
     const anchor = {
       x: (event.clientX - rect.left - camera.x) / camera.zoom,
       y: (event.clientY - rect.top - camera.y) / camera.zoom
@@ -631,6 +716,7 @@ canvas.addEventListener("wheel", event => {
     camera.x -= event.deltaX;
     camera.y -= event.deltaY;
   }
+  constrainCamera();
   requestRender();
 }, { passive: false });
 
@@ -640,6 +726,7 @@ function eraseAt(world) {
   for (let i = strokes.length - 1; i >= 0; i--) {
     if (strokeHit(strokes[i], world, radius)) {
       strokes.splice(i, 1);
+      invalidateBounds();
       render(); save(); refreshBar();
       return;
     }
@@ -668,12 +755,14 @@ const clamp = (value, lo, hi) => Math.min(hi, Math.max(lo, value));
 function undo() {
   if (!page().strokes.length) return;
   redoStack.push(page().strokes.pop());
+  invalidateBounds();
   render(); save(); refreshBar();
 }
 
 function redo() {
   if (!redoStack.length) return;
   page().strokes.push(redoStack.pop());
+  invalidateBounds();
   render(); save(); refreshBar();
 }
 
@@ -720,32 +809,82 @@ function snapshot(strokes) {
    Solve
    ============================================================ */
 
-const PROMPT = `The image is a handwritten mathematics or physics page. Solve the question on it.
+const PROMPT = `The image shows a question, either handwritten or photographed from a screen or a book. Solve it.
 
-If the page also contains an attempt at a solution, ignore it completely. Solve the question independently and do not comment on the attempt.
+If the image also contains an attempt at a solution, ignore it completely. Solve the question independently and do not comment on the attempt.
 
 Reply in exactly this structure and nothing else:
 
 ## Answer
-The final result only. One or two lines. No derivation.
+For a mathematics or physics question, the final result only, one or two lines, no derivation.
+For a programming question, the complete working solution as code in a fenced block tagged with the language, and nothing else in this section. Write it as you would submit it: no placeholder comments, no omitted bodies.
 
 ## Working
-Begin with "Question as read:" and restate the problem as you read it from the handwriting, so a misreading is obvious. Then give the full solution, one step per line, naming the result or identity used whenever a step is not routine algebra.
+Begin with "Question as read:" and restate the problem as you read it from the image, so a misreading is obvious.
+For mathematics, give the full solution, one step per line, naming the result or identity used whenever a step is not routine algebra.
+For programming, explain the approach, why it is correct, and its time and space complexity. Note any edge case the code handles deliberately.
 
 Rules:
 - All mathematics in LaTeX: $...$ inline, $$...$$ displayed. Never use \\( or \\[.
-- If the handwriting is ambiguous, solve the most plausible reading and say which reading you chose.
-- If the page holds several questions, answer each under its own subheading in both sections.
-- If the page holds no question, say so in the Answer section rather than inventing one.`;
+- If the question names a language, use it. If not, use Python.
+- If the image is ambiguous, solve the most plausible reading and say which reading you chose.
+- If the image holds several questions, answer each under its own subheading in both sections.
+- If the image holds no question, say so in the Answer section rather than inventing one.`;
 
 let solving = false;
 
 async function solve() {
-  if (solving) return;
-  if (!settings.key.trim()) { openSettings(); return; }
-
   const image = snapshot(page().strokes);
   if (!image) { fail("Nothing on the page yet. Write a question, then press and hold the corner."); return; }
+  requestSolution(image, "image/png");
+}
+
+/* Photos come off a 12 megapixel sensor, which is both slower and
+   dearer than it needs to be, so scale to the API's ideal long edge
+   and re-encode as JPEG before sending. */
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("That image could not be read.")); };
+    image.src = url;
+  });
+}
+
+async function photoToBase64(file) {
+  const image = await loadImage(file);
+  const longEdge = Math.max(image.naturalWidth, image.naturalHeight);
+  if (!longEdge) throw new Error("That image has no dimensions.");
+
+  const scale = Math.min(1568 / longEdge, 1);
+  const off = document.createElement("canvas");
+  off.width = Math.round(image.naturalWidth * scale);
+  off.height = Math.round(image.naturalHeight * scale);
+
+  const g = off.getContext("2d");
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, off.width, off.height);
+  g.drawImage(image, 0, 0, off.width, off.height);
+
+  return off.toDataURL("image/jpeg", 0.85).split(",")[1];
+}
+
+async function solvePhoto(file) {
+  if (solving) return;
+  openPanel();
+  thinking();
+  try {
+    const image = await photoToBase64(file);
+    await requestSolution(image, "image/jpeg");
+  } catch (error) {
+    fail(explain(error));
+  }
+}
+
+async function requestSolution(image, mediaType) {
+  if (solving) return;
+  if (!settings.key.trim()) { openSettings(); return; }
 
   solving = true;
   dot.classList.add("busy");
@@ -774,7 +913,7 @@ async function solve() {
         messages: [{
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: image } },
+            { type: "image", source: { type: "base64", media_type: mediaType, data: image } },
             { type: "text", text }
           ]
         }]
@@ -911,11 +1050,21 @@ function setTool(next) {
 
 document.getElementById("tPen").addEventListener("click", () => setTool("pen"));
 document.getElementById("tEraser").addEventListener("click", () => setTool("eraser"));
+document.getElementById("fit").addEventListener("click", fitToInk);
+
+const cameraInput = document.getElementById("camera");
+document.getElementById("photo").addEventListener("click", () => cameraInput.click());
+cameraInput.addEventListener("change", () => {
+  const file = cameraInput.files && cameraInput.files[0];
+  cameraInput.value = "";
+  if (file) solvePhoto(file);
+});
 
 function goTo(target) {
   flushNow();
   index = clamp(target, 0, pages.length - 1);
   camera.x = 0; camera.y = 0; camera.zoom = 1;
+  invalidateBounds();
   redoStack = [];
   closePanel();
   render(); refreshBar();
@@ -959,6 +1108,7 @@ document.getElementById("wipe").addEventListener("click", () => {
   page().strokes = [];
   page().solution = null;
   redoStack = [];
+  invalidateBounds();
   closePanel();
   render(); save(); refreshBar();
   scrim.classList.remove("show");
